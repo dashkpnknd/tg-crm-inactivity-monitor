@@ -1,0 +1,8 @@
+services:
+  crm-monitor:
+    build: .
+    container_name: crm-inactivity-monitor
+    env_file: .env
+    volumes:
+      - ./data:/app/data
+    restart: unless-stopped
