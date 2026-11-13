@@ -168,15 +168,15 @@ class Database:
         self.connection.commit()
 
     def stale_unnotified_chats(
-        self, cutoff: datetime, reminder_cutoff: datetime, priority_chat_id: int | None = None
+        self, cutoff: datetime, priority_chat_id: int | None = None
     ) -> list[MonitoredChat]:
         rows = self.connection.execute(
             "SELECT * FROM chats WHERE is_excluded = 0 AND last_activity_at IS NOT NULL "
             "AND last_activity_at <= ? AND (resolved_for_activity_at IS NULL "
             "OR resolved_for_activity_at <> last_activity_at) "
-            "AND (last_alert_sent_at IS NULL OR last_alert_sent_at <= ?) "
+            "AND notified_for_activity_at IS NULL "
             "ORDER BY CASE WHEN chat_id = ? THEN 0 ELSE 1 END, last_activity_at DESC",
-            (cutoff.isoformat(), reminder_cutoff.isoformat(), priority_chat_id),
+            (cutoff.isoformat(), priority_chat_id),
         ).fetchall()
         return [self._chat_from_row(row) for row in rows]
 

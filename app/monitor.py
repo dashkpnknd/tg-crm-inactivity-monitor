@@ -116,12 +116,11 @@ class InactivityMonitor:
                 observed = await self._sync_catalog(target_chat_id)
                 self._last_full_sync = now
             cutoff = datetime.now(UTC) - timedelta(days=self.settings.inactivity_days)
-            reminder_cutoff = datetime.now(UTC) - timedelta(hours=self.settings.reminder_hours)
             alerts = 0
             priority_chat_id = self.database.get_setting("priority_chat_id")
             priority = int(priority_chat_id) if priority_chat_id else None
             stale_chats = self.database.stale_unnotified_chats(
-                cutoff, reminder_cutoff, priority
+                cutoff, priority
             )[: self.settings.max_alerts_per_scan]
             for index, chat in enumerate(stale_chats):
                 await self._send_alert_with_backoff(target_chat_id, chat)
@@ -302,66 +301,19 @@ class InactivityMonitor:
         )
 
     async def _send_alert(self, target_chat_id: int, chat: MonitoredChat) -> None:
-        """Send a fresh daily card and remove the previous card for the same chat."""
+        """Send one card per inactivity cycle, preserving any existing card."""
         assert chat.last_activity_at is not None
+        if chat.notification_message_id is not None:
+            # Repair an inconsistent row without creating a duplicate message.
+            self.database.mark_notified(
+                chat.chat_id, chat.last_activity_at,
+                chat.notification_message_id, datetime.now(UTC),
+            )
+            return
         inactivity = _format_duration(datetime.now(UTC) - chat.last_activity_at)
         text = (
             f"<b>{_escape(chat.title)}</b> — нет активности <b>{inactivity}</b>."
         )
-
-        # Daily reminders must be a new message (so the card stays recent and can be
-        # removed by its buttons), while the previous day's card is deleted first.
-        if chat.notification_message_id is not None:
-            try:
-                await self.bot.delete_message(
-                    chat_id=target_chat_id,
-                    message_id=chat.notification_message_id,
-                )
-            except TelegramBadRequest as error:
-                description = error.message.lower()
-                if "not found" in description:
-                    # Someone removed the previous card by hand. It is safe to replace it.
-                    self.database.clear_notification(chat.chat_id)
-                else:
-                    # Do not create a second card if Telegram refuses the deletion (for
-                    # example, after its 48-hour deletion window). Update the remaining
-                    # card instead, keeping CRM to one visible card for this client.
-                    logger.warning(
-                        "Could not delete previous alert card %s for chat %s: %s; refreshing it instead",
-                        chat.notification_message_id,
-                        chat.chat_id,
-                        error.message,
-                    )
-                    try:
-                        await self.bot.edit_message_text(
-                            chat_id=target_chat_id,
-                            message_id=chat.notification_message_id,
-                            text=text,
-                            reply_markup=alert_keyboard(chat),
-                        )
-                    except TelegramBadRequest as edit_error:
-                        logger.warning(
-                            "Could not refresh undeletable alert card %s for chat %s: %s",
-                            chat.notification_message_id,
-                            chat.chat_id,
-                            edit_error.message,
-                        )
-                        return
-                    self.database.mark_notified(
-                        chat.chat_id,
-                        chat.last_activity_at,
-                        chat.notification_message_id,
-                        datetime.now(UTC),
-                    )
-                    return
-            else:
-                logger.info(
-                    "Deleted previous alert card %s for chat %s before sending daily reminder",
-                    chat.notification_message_id,
-                    chat.chat_id,
-                )
-                self.database.clear_notification(chat.chat_id)
-
         message = await self.bot.send_message(
             target_chat_id,
             text,
@@ -383,8 +335,8 @@ class InactivityMonitor:
                 reply_markup=alert_keyboard(chat),
             )
         except TelegramBadRequest as error:
-            # The card may have been manually deleted; the next scheduled reminder
-            # will create a new one rather than falsely claiming the rename succeeded.
+            # The card may have been manually deleted. Keep the sent marker so it
+            # cannot be recreated as an unwanted repeat.
             logger.warning(
                 "Could not refresh card %s after metadata update for chat %s: %s",
                 chat.notification_message_id,

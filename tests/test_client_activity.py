@@ -36,7 +36,10 @@ class ClientActivityTests(unittest.IsolatedAsyncioTestCase):
         self.database.set_target_chat_id(999)
         self.addCleanup(self.database.close)
         self.settings = SimpleNamespace(inactivity_days=3, team_user_ids=frozenset({123}))
-        self.bot = SimpleNamespace(delete_message=AsyncMock(), edit_message_text=AsyncMock())
+        self.bot = SimpleNamespace(
+            delete_message=AsyncMock(), edit_message_text=AsyncMock(),
+            send_message=AsyncMock(),
+        )
         self.client = SimpleNamespace()
         self.monitor = InactivityMonitor(
             self.settings, self.database, SimpleNamespace(client=self.client), self.bot
@@ -120,6 +123,30 @@ class ClientActivityTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(chat.last_activity_at, old_activity)
         self.assertEqual(chat.notification_message_id, 90)
         self.bot.delete_message.assert_not_awaited()
+
+    async def test_alert_is_sent_once_until_client_starts_new_cycle(self):
+        now = datetime.now(UTC)
+        old_activity = now - timedelta(days=4)
+        self.database.upsert_chat(100, "Client", None, old_activity, 1)
+        self.assertEqual(
+            len(self.database.stale_unnotified_chats(now - timedelta(days=3))), 1
+        )
+
+        self.database.mark_notified(100, old_activity, 90, now)
+        self.assertEqual(
+            self.database.stale_unnotified_chats(now + timedelta(days=30)), []
+        )
+        await self.monitor._send_alert(999, self.database.get_chat(100))
+        self.bot.send_message.assert_not_awaited()
+        self.bot.delete_message.assert_not_awaited()
+
+        self.database.record_activity(100, now, 2)
+        self.assertEqual(
+            len(self.database.stale_unnotified_chats(now - timedelta(days=2))), 0
+        )
+        self.assertEqual(
+            len(self.database.stale_unnotified_chats(now + timedelta(days=1))), 1
+        )
 
 
 if __name__ == "__main__":
