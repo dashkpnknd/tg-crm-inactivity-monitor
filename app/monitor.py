@@ -16,8 +16,6 @@ from app.database import Database, MonitoredChat
 
 logger = logging.getLogger(__name__)
 UTC = timezone.utc
-AVITO_REPORT_BOT_USERNAME = "avitoreportstat_bot"
-AVITO_STATISTICS_PREFIX = "📊 Статистика:"
 
 
 def chat_url(entity: object, chat_id: int, message_id: int | None) -> str | None:
@@ -32,16 +30,6 @@ def chat_url(entity: object, chat_id: int, message_id: int | None) -> str | None
         return f"https://t.me/c/{internal_id}/{message_id}"
     # Legacy basic groups have no web link. Telegram Desktop/mobile understands this URI.
     return f"tg://openmessage?chat_id={chat_id}&message_id={message_id}"
-
-
-def is_avito_statistics_message(text: str | None, sender_username: str | None) -> bool:
-    """Return true only for the automated daily Avito report, never a human message."""
-    return bool(
-        text
-        and text.startswith(AVITO_STATISTICS_PREFIX)
-        and sender_username
-        and sender_username.casefold() == AVITO_REPORT_BOT_USERNAME
-    )
 
 
 class AccountLogin:
@@ -156,20 +144,35 @@ class InactivityMonitor:
                 await self._retire_migrated_chat(target_chat_id, dialog.id)
                 continue
             existing = self.database.get_chat(dialog.id)
-            last_message = await self._last_relevant_message(dialog.entity, dialog.message)
+            if existing and existing.is_excluded:
+                continue
+            last_message = await self._last_client_message(dialog.entity, dialog.message)
+            cutoff = datetime.now(UTC) - timedelta(days=self.settings.inactivity_days)
             # A group with no messages is still tracked: its three-day timer starts
             # when it is first discovered, rather than alerting immediately.
             activity_at = last_message.date if last_message else (existing.last_activity_at if existing else datetime.now(UTC))
+            if existing and not existing.client_activity_initialized and last_message is None:
+                # The old timestamp may belong to a staff member or a bot. If no
+                # client wrote in the last three days, this chat is already stale.
+                activity_at = min(activity_at or cutoff, cutoff)
             message_id = last_message.id if last_message else (existing.last_message_id if existing else None)
+            if (
+                existing and last_message and existing.last_activity_at
+                and last_message.date > existing.last_activity_at
+            ):
+                await self._delete_open_card_after_client_message(target_chat_id, existing)
             chat = self.database.upsert_chat(
                 chat_id=dialog.id,
                 title=dialog.name or "Без названия",
                 url=chat_url(dialog.entity, dialog.id, message_id),
-                # A service-only event should not erase a previously known human-message date.
+                # A service or staff message must not replace the last client date.
                 last_activity_at=activity_at,
                 last_message_id=message_id,
             )
-            if existing and (existing.title != chat.title or existing.url != chat.url):
+            if existing and (
+                existing.title != chat.title or existing.url != chat.url
+                or (existing.notification_message_id and existing.last_activity_at != chat.last_activity_at)
+            ):
                 await self._refresh_existing_card(target_chat_id, chat)
             observed += 1
         return observed
@@ -181,45 +184,49 @@ class InactivityMonitor:
         self._listener_started = True
         logger.info("Live Telegram activity listener started")
 
-    async def _is_avito_statistics_message(self, message: Message) -> bool:
-        if not (message.message or "").startswith(AVITO_STATISTICS_PREFIX):
+    async def _is_client_message(self, message: Message) -> bool:
+        """Identify clients by stable Telegram ID, never by a mutable username."""
+        if message.out or message.sender_id is None or message.sender_id <= 0:
+            return False
+        if message.sender_id in self.settings.team_user_ids:
             return False
         sender = await message.get_sender()
-        return is_avito_statistics_message(message.message, getattr(sender, "username", None))
+        return sender is not None and not getattr(sender, "bot", False)
 
-    async def _last_relevant_message(self, entity: object, latest: object) -> Message | None:
-        """Skip an automated Avito report when determining the last client activity."""
-        if not isinstance(latest, Message):
-            return None
-        if not await self._is_avito_statistics_message(latest):
+    async def _last_client_message(self, entity: object, latest: object) -> Message | None:
+        """Look back only through the inactivity window when staff or bots wrote last."""
+        cutoff = datetime.now(UTC) - timedelta(days=self.settings.inactivity_days)
+        if isinstance(latest, Message) and await self._is_client_message(latest):
             return latest
-
-        # The report is the dialog's latest message. Read back only this chat until
-        # the first human message, so a nightly catalog sync cannot reset its timer.
-        async for candidate in self.login.client.iter_messages(entity, limit=100):
-            if candidate.id == latest.id or isinstance(candidate, MessageService):
+        if latest is None or getattr(latest, "date", cutoff) < cutoff:
+            return None
+        async for candidate in self.login.client.iter_messages(entity):
+            if isinstance(candidate, MessageService):
                 continue
-            if not await self._is_avito_statistics_message(candidate):
-                logger.info("Ignored latest Avito statistics report in chat %s", candidate.chat_id)
+            if not isinstance(candidate, Message):
+                continue
+            if await self._is_client_message(candidate):
                 return candidate
+            if candidate.date < cutoff:
+                break
         return None
 
-    async def _delete_open_card_after_ksusha_message(self, target_chat_id: int, chat: MonitoredChat) -> None:
-        """Remove an open CRM task as soon as Ksyusha has responded in that chat."""
+    async def _delete_open_card_after_client_message(self, target_chat_id: int, chat: MonitoredChat) -> None:
+        """Remove an open CRM task as soon as a client has participated."""
         if chat.notification_message_id is None:
             return
         try:
             await self.bot.delete_message(target_chat_id, chat.notification_message_id)
         except TelegramBadRequest as error:
             logger.warning(
-                "Could not delete CRM card %s after Ksyusha replied in chat %s: %s",
+                "Could not delete CRM card %s after client replied in chat %s: %s",
                 chat.notification_message_id,
                 chat.chat_id,
                 error.message,
             )
         else:
             logger.info(
-                "Deleted CRM card %s after Ksyusha replied in chat %s",
+                "Deleted CRM card %s after client replied in chat %s",
                 chat.notification_message_id,
                 chat.chat_id,
             )
@@ -277,12 +284,11 @@ class InactivityMonitor:
         if not isinstance(message, Message):
             return
         known = self.database.get_chat(event.chat_id)
-        if await self._is_avito_statistics_message(message):
-            logger.info("Ignored Avito statistics report in chat %s", event.chat_id)
+        if not await self._is_client_message(message):
+            logger.info("Ignored non-client message in chat %s", event.chat_id)
             return
         if known is not None:
-            if message.out:
-                await self._delete_open_card_after_ksusha_message(target_chat_id, known)
+            await self._delete_open_card_after_client_message(target_chat_id, known)
             self.database.record_activity(event.chat_id, message.date, message.id)
             return
         # A group added after the initial inventory is discovered from its first update.

@@ -21,6 +21,7 @@ class Settings:
     phone: str
     bot_token: str
     controller_user_ids: frozenset[int]
+    team_user_ids: frozenset[int]
     inactivity_days: int
     check_interval_minutes: int
     full_sync_interval_hours: int
@@ -36,6 +37,11 @@ class Settings:
         controller_ids = frozenset(
             int(value.strip())
             for value in os.getenv("CONTROLLER_USER_IDS", "").split(",")
+            if value.strip()
+        )
+        team_ids = frozenset(
+            int(value.strip())
+            for value in os.getenv("TEAM_USER_IDS", "").split(",")
             if value.strip()
         )
         inactivity_days = int(os.getenv("INACTIVITY_DAYS", "3"))
@@ -58,6 +64,7 @@ class Settings:
             phone=_required("KSUSHA_PHONE"),
             bot_token=_required("BOT_TOKEN"),
             controller_user_ids=controller_ids,
+            team_user_ids=team_ids,
             inactivity_days=inactivity_days,
             check_interval_minutes=check_interval_minutes,
             full_sync_interval_hours=full_sync_interval_hours,

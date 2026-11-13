@@ -16,6 +16,7 @@ class MonitoredChat:
     is_excluded: bool
     notified_for_activity_at: datetime | None
     notification_message_id: int | None
+    client_activity_initialized: bool
 
 
 class Database:
@@ -42,6 +43,7 @@ class Database:
                 notification_message_id INTEGER
                 ,last_alert_sent_at TEXT
                 ,resolved_for_activity_at TEXT
+                ,client_activity_initialized INTEGER NOT NULL DEFAULT 0
             );
             """
         )
@@ -54,6 +56,12 @@ class Database:
                 self.connection.execute(f"ALTER TABLE chats ADD COLUMN {column} TEXT")
             except sqlite3.OperationalError:
                 pass
+        try:
+            self.connection.execute(
+                "ALTER TABLE chats ADD COLUMN client_activity_initialized INTEGER NOT NULL DEFAULT 0"
+            )
+        except sqlite3.OperationalError:
+            pass
         # Cards sent before reminders were introduced should not all repeat on the next restart.
         self.connection.execute(
             "UPDATE chats SET last_alert_sent_at = ? "
@@ -105,18 +113,30 @@ class Database:
         existing = self.get_chat(chat_id)
         last_activity_text = last_activity_at.isoformat() if last_activity_at else None
         if existing and existing.last_activity_at != last_activity_at:
-            # A new actual message starts a new inactivity cycle.
-            self.connection.execute(
-                "UPDATE chats SET title=?, url=?, last_activity_at=?, "
-                "last_message_id=?, notified_for_activity_at=NULL, notification_message_id=NULL, "
-                "last_alert_sent_at=NULL, resolved_for_activity_at=NULL WHERE chat_id=?",
-                (title, url, last_activity_text, last_message_id, chat_id),
-            )
+            if existing.last_activity_at is None or (
+                last_activity_at is not None and last_activity_at > existing.last_activity_at
+            ):
+                # A newer client message starts a fresh inactivity cycle.
+                self.connection.execute(
+                    "UPDATE chats SET title=?, url=?, last_activity_at=?, last_message_id=?, "
+                    "client_activity_initialized=1, notified_for_activity_at=NULL, "
+                    "notification_message_id=NULL, last_alert_sent_at=NULL, "
+                    "resolved_for_activity_at=NULL WHERE chat_id=?",
+                    (title, url, last_activity_text, last_message_id, chat_id),
+                )
+            else:
+                # Correcting a legacy team-message timestamp must keep an open CRM card.
+                self.connection.execute(
+                    "UPDATE chats SET title=?, url=?, last_activity_at=?, last_message_id=?, "
+                    "client_activity_initialized=1, resolved_for_activity_at=NULL WHERE chat_id=?",
+                    (title, url, last_activity_text, last_message_id, chat_id),
+                )
         else:
             self.connection.execute(
-                "INSERT INTO chats(chat_id, title, url, last_activity_at, last_message_id) VALUES (?, ?, ?, ?, ?) "
+                "INSERT INTO chats(chat_id, title, url, last_activity_at, last_message_id, "
+                "client_activity_initialized) VALUES (?, ?, ?, ?, ?, 1) "
                 "ON CONFLICT(chat_id) DO UPDATE SET title=excluded.title, url=excluded.url, "
-                "last_message_id=excluded.last_message_id",
+                "last_message_id=excluded.last_message_id, client_activity_initialized=1",
                 (chat_id, title, url, last_activity_text, last_message_id),
             )
         self.connection.commit()
@@ -135,11 +155,14 @@ class Database:
     def record_activity(self, chat_id: int, activity_at: datetime, message_id: int) -> None:
         """Start a fresh inactivity cycle after a live incoming message."""
         existing = self.get_chat(chat_id)
-        if existing is None or (existing.last_activity_at == activity_at and existing.last_message_id == message_id):
+        if existing is None or (
+            existing.last_activity_at is not None and activity_at < existing.last_activity_at
+        ) or (existing.last_activity_at == activity_at and existing.last_message_id == message_id):
             return
         self.connection.execute(
             "UPDATE chats SET last_activity_at=?, last_message_id=?, notified_for_activity_at=NULL, "
-            "notification_message_id=NULL, last_alert_sent_at=NULL, resolved_for_activity_at=NULL WHERE chat_id=?",
+            "notification_message_id=NULL, last_alert_sent_at=NULL, resolved_for_activity_at=NULL, "
+            "client_activity_initialized=1 WHERE chat_id=?",
             (activity_at.isoformat(), message_id, chat_id),
         )
         self.connection.commit()
@@ -218,4 +241,5 @@ class Database:
             is_excluded=bool(row["is_excluded"]),
             notified_for_activity_at=date(row["notified_for_activity_at"]),
             notification_message_id=row["notification_message_id"],
+            client_activity_initialized=bool(row["client_activity_initialized"]),
         )
