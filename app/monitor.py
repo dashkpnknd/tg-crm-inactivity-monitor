@@ -16,6 +16,8 @@ from app.database import Database, MonitoredChat
 
 logger = logging.getLogger(__name__)
 UTC = timezone.utc
+AVITO_REPORT_BOT_USERNAME = "avitoreportstat_bot"
+AVITO_REPORT_BOT_ID = 8721424338
 
 
 def chat_url(entity: object, chat_id: int, message_id: int | None) -> str | None:
@@ -145,26 +147,26 @@ class InactivityMonitor:
             existing = self.database.get_chat(dialog.id)
             if existing and existing.is_excluded:
                 continue
-            last_message = await self._last_client_message(dialog.entity, dialog.message)
+            last_message = await self._last_relevant_message(dialog.entity, dialog.message)
             cutoff = datetime.now(UTC) - timedelta(days=self.settings.inactivity_days)
             # A group with no messages is still tracked: its three-day timer starts
             # when it is first discovered, rather than alerting immediately.
             activity_at = last_message.date if last_message else (existing.last_activity_at if existing else datetime.now(UTC))
             if existing and not existing.client_activity_initialized and last_message is None:
-                # The old timestamp may belong to a staff member or a bot. If no
-                # client wrote in the last three days, this chat is already stale.
+                # The old timestamp may belong to an automated message. If no
+                # relevant message arrived recently, this chat is already stale.
                 activity_at = min(activity_at or cutoff, cutoff)
             message_id = last_message.id if last_message else (existing.last_message_id if existing else None)
             if (
                 existing and last_message and existing.last_activity_at
                 and last_message.date > existing.last_activity_at
             ):
-                await self._delete_open_card_after_client_message(target_chat_id, existing)
+                await self._delete_open_card_after_activity(target_chat_id, existing)
             chat = self.database.upsert_chat(
                 chat_id=dialog.id,
                 title=dialog.name or "Без названия",
                 url=chat_url(dialog.entity, dialog.id, message_id),
-                # A service or staff message must not replace the last client date.
+                # A service or excluded automated message must not reset the timer.
                 last_activity_at=activity_at,
                 last_message_id=message_id,
             )
@@ -183,19 +185,18 @@ class InactivityMonitor:
         self._listener_started = True
         logger.info("Live Telegram activity listener started")
 
-    async def _is_client_message(self, message: Message) -> bool:
-        """Identify clients by stable Telegram ID, never by a mutable username."""
-        if message.out or message.sender_id is None or message.sender_id <= 0:
-            return False
-        if message.sender_id in self.settings.team_user_ids:
+    async def _is_relevant_message(self, message: Message) -> bool:
+        """Count team and customer activity, excluding the Avito report bot."""
+        if message.sender_id == AVITO_REPORT_BOT_ID:
             return False
         sender = await message.get_sender()
-        return sender is not None and not getattr(sender, "bot", False)
+        username = (getattr(sender, "username", None) or "").casefold()
+        return not (getattr(sender, "bot", False) and username == AVITO_REPORT_BOT_USERNAME)
 
-    async def _last_client_message(self, entity: object, latest: object) -> Message | None:
-        """Look back only through the inactivity window when staff or bots wrote last."""
+    async def _last_relevant_message(self, entity: object, latest: object) -> Message | None:
+        """Look back through excluded automated messages to the last activity."""
         cutoff = datetime.now(UTC) - timedelta(days=self.settings.inactivity_days)
-        if isinstance(latest, Message) and await self._is_client_message(latest):
+        if isinstance(latest, Message) and await self._is_relevant_message(latest):
             return latest
         if latest is None or getattr(latest, "date", cutoff) < cutoff:
             return None
@@ -204,28 +205,28 @@ class InactivityMonitor:
                 continue
             if not isinstance(candidate, Message):
                 continue
-            if await self._is_client_message(candidate):
+            if await self._is_relevant_message(candidate):
                 return candidate
             if candidate.date < cutoff:
                 break
         return None
 
-    async def _delete_open_card_after_client_message(self, target_chat_id: int, chat: MonitoredChat) -> None:
-        """Remove an open CRM task as soon as a client has participated."""
+    async def _delete_open_card_after_activity(self, target_chat_id: int, chat: MonitoredChat) -> None:
+        """Remove an open CRM task after new team or customer activity."""
         if chat.notification_message_id is None:
             return
         try:
             await self.bot.delete_message(target_chat_id, chat.notification_message_id)
         except TelegramBadRequest as error:
             logger.warning(
-                "Could not delete CRM card %s after client replied in chat %s: %s",
+                "Could not delete CRM card %s after activity in chat %s: %s",
                 chat.notification_message_id,
                 chat.chat_id,
                 error.message,
             )
         else:
             logger.info(
-                "Deleted CRM card %s after client replied in chat %s",
+                "Deleted CRM card %s after activity in chat %s",
                 chat.notification_message_id,
                 chat.chat_id,
             )
@@ -283,11 +284,11 @@ class InactivityMonitor:
         if not isinstance(message, Message):
             return
         known = self.database.get_chat(event.chat_id)
-        if not await self._is_client_message(message):
-            logger.info("Ignored non-client message in chat %s", event.chat_id)
+        if not await self._is_relevant_message(message):
+            logger.info("Ignored Avito report in chat %s", event.chat_id)
             return
         if known is not None:
-            await self._delete_open_card_after_client_message(target_chat_id, known)
+            await self._delete_open_card_after_activity(target_chat_id, known)
             self.database.record_activity(event.chat_id, message.date, message.id)
             return
         # A group added after the initial inventory is discovered from its first update.

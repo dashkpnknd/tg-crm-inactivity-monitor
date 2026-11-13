@@ -35,7 +35,7 @@ class ClientActivityTests(unittest.IsolatedAsyncioTestCase):
         self.database.initialize()
         self.database.set_target_chat_id(999)
         self.addCleanup(self.database.close)
-        self.settings = SimpleNamespace(inactivity_days=3, team_user_ids=frozenset({123}))
+        self.settings = SimpleNamespace(inactivity_days=3)
         self.bot = SimpleNamespace(
             delete_message=AsyncMock(), edit_message_text=AsyncMock(),
             send_message=AsyncMock(),
@@ -45,46 +45,52 @@ class ClientActivityTests(unittest.IsolatedAsyncioTestCase):
             self.settings, self.database, SimpleNamespace(client=self.client), self.bot
         )
 
-    async def test_staff_id_is_ignored_with_either_username(self):
+    async def test_staff_and_other_bots_count_but_avito_report_does_not(self):
         now = datetime.now(UTC)
         for username in ("first_name", "second_name"):
             with self.subTest(username=username):
                 staff = message(1, 123, now, username=username)
-                self.assertFalse(await self.monitor._is_client_message(staff))
-        self.assertFalse(await self.monitor._is_client_message(message(2, 456, now, bot=True)))
-        self.assertFalse(await self.monitor._is_client_message(message(3, 456, now, out=True)))
-        self.assertTrue(await self.monitor._is_client_message(message(4, 456, now)))
+                self.assertTrue(await self.monitor._is_relevant_message(staff))
+        self.assertTrue(await self.monitor._is_relevant_message(message(2, 456, now, bot=True)))
+        self.assertTrue(await self.monitor._is_relevant_message(message(3, 456, now, out=True)))
+        self.assertFalse(await self.monitor._is_relevant_message(
+            message(4, 789, now, bot=True, username="AvitoReportStat_bot")
+        ))
+        self.assertFalse(await self.monitor._is_relevant_message(
+            message(6, 8721424338, now, bot=True)
+        ))
+        self.assertTrue(await self.monitor._is_relevant_message(message(5, 456, now)))
 
-    async def test_catalog_looks_past_staff_and_bot_messages(self):
+    async def test_catalog_looks_past_avito_report_to_team_message(self):
         now = datetime.now(UTC)
         client = message(1, 456, now - timedelta(days=2))
-        bot = message(2, 789, now - timedelta(days=1), bot=True)
-        staff = message(3, 123, now)
+        staff = message(2, 123, now - timedelta(days=1))
+        avito = message(3, 789, now, bot=True, username="avitoReportStat_bot")
 
         async def iter_messages(_entity):
-            for item in (staff, bot, client):
+            for item in (avito, staff, client):
                 yield item
 
         self.client.iter_messages = iter_messages
-        self.assertIs(await self.monitor._last_client_message(object(), staff), client)
+        self.assertIs(await self.monitor._last_relevant_message(object(), avito), staff)
 
-    async def test_existing_staff_only_chat_becomes_stale_without_losing_card(self):
+    async def test_existing_avito_only_chat_becomes_stale_without_losing_card(self):
         now = datetime.now(UTC)
-        staff = message(3, 123, now)
+        avito = message(3, 789, now, bot=True, username="avitoReportStat_bot")
         self.database.connection.execute(
             "INSERT INTO chats(chat_id,title,last_activity_at,last_message_id,"
             "notification_message_id,last_alert_sent_at) VALUES (100,'Client',?,?,?,?)",
-            (staff.date.isoformat(), staff.id, 90, now.isoformat()),
+            (avito.date.isoformat(), avito.id, 90, now.isoformat()),
         )
         self.database.connection.commit()
 
         async def iter_messages(_entity):
-            yield staff
+            yield avito
 
         self.client.iter_messages = iter_messages
         self.client.get_dialogs = AsyncMock(return_value=[SimpleNamespace(
             is_group=True, id=100, entity=SimpleNamespace(title="Client"),
-            message=staff, name="Client",
+            message=avito, name="Client",
         )])
         await self.monitor._sync_catalog(999)
 
@@ -108,7 +114,7 @@ class ClientActivityTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(chat.last_message_id, 2)
         self.assertIsNone(chat.notification_message_id)
 
-    async def test_staff_message_does_not_change_timer_or_open_card(self):
+    async def test_staff_message_updates_timer_and_closes_open_card(self):
         now = datetime.now(UTC)
         old_activity = now - timedelta(days=4)
         self.database.upsert_chat(100, "Client", None, old_activity, 1)
@@ -120,9 +126,9 @@ class ClientActivityTests(unittest.IsolatedAsyncioTestCase):
         )
 
         chat = self.database.get_chat(100)
-        self.assertEqual(chat.last_activity_at, old_activity)
-        self.assertEqual(chat.notification_message_id, 90)
-        self.bot.delete_message.assert_not_awaited()
+        self.assertEqual(chat.last_activity_at, now)
+        self.assertIsNone(chat.notification_message_id)
+        self.bot.delete_message.assert_awaited_once_with(999, 90)
 
     async def test_alert_is_sent_once_until_client_starts_new_cycle(self):
         now = datetime.now(UTC)
