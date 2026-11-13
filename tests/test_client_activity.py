@@ -5,6 +5,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
+from aiogram.exceptions import TelegramBadRequest
+from aiogram.methods import DeleteMessage
 from telethon.tl.types import Message, PeerChat, PeerUser, User
 
 from app.database import Database
@@ -129,6 +131,33 @@ class ClientActivityTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(chat.last_activity_at, now)
         self.assertIsNone(chat.notification_message_id)
         self.bot.delete_message.assert_awaited_once_with(999, 90)
+
+    async def test_old_card_uses_admin_fallback_after_bot_api_refuses(self):
+        self.bot.delete_message.side_effect = TelegramBadRequest(
+            method=DeleteMessage(chat_id=999, message_id=90),
+            message="message can't be deleted",
+        )
+        self.bot.me = AsyncMock(return_value=SimpleNamespace(id=8804717222))
+        self.client.get_messages = AsyncMock(return_value=SimpleNamespace(sender_id=8804717222))
+        self.client.delete_messages = AsyncMock()
+
+        self.assertTrue(await self.monitor.delete_crm_card(999, 90))
+
+        self.client.get_messages.assert_awaited_once_with(999, ids=90)
+        self.client.delete_messages.assert_awaited_once_with(999, [90], revoke=True)
+
+    async def test_admin_fallback_refuses_messages_from_other_senders(self):
+        self.bot.delete_message.side_effect = TelegramBadRequest(
+            method=DeleteMessage(chat_id=999, message_id=90),
+            message="message can't be deleted",
+        )
+        self.bot.me = AsyncMock(return_value=SimpleNamespace(id=8804717222))
+        self.client.get_messages = AsyncMock(return_value=SimpleNamespace(sender_id=123))
+        self.client.delete_messages = AsyncMock()
+
+        self.assertFalse(await self.monitor.delete_crm_card(999, 90))
+
+        self.client.delete_messages.assert_not_awaited()
 
     async def test_alert_is_sent_once_until_client_starts_new_cycle(self):
         now = datetime.now(UTC)

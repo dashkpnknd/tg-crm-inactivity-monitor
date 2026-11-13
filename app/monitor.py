@@ -215,21 +215,37 @@ class InactivityMonitor:
         """Remove an open CRM task after new team or customer activity."""
         if chat.notification_message_id is None:
             return
-        try:
-            await self.bot.delete_message(target_chat_id, chat.notification_message_id)
-        except TelegramBadRequest as error:
-            logger.warning(
-                "Could not delete CRM card %s after activity in chat %s: %s",
-                chat.notification_message_id,
-                chat.chat_id,
-                error.message,
-            )
-        else:
+        if await self.delete_crm_card(target_chat_id, chat.notification_message_id):
             logger.info(
                 "Deleted CRM card %s after activity in chat %s",
                 chat.notification_message_id,
                 chat.chat_id,
             )
+
+    async def delete_crm_card(self, target_chat_id: int, message_id: int) -> bool:
+        """Use the CRM admin account when Bot API cannot remove an old card."""
+        try:
+            await self.bot.delete_message(target_chat_id, message_id)
+            return True
+        except TelegramBadRequest as error:
+            bot_error = error.message
+        try:
+            card = await self.login.client.get_messages(target_chat_id, ids=message_id)
+            if card is None:
+                return True  # It was already removed from the CRM group.
+            bot_user = await self.bot.me()
+            if card.sender_id != bot_user.id:
+                logger.warning("Refusing to delete CRM message %s: sender is not this bot", message_id)
+                return False
+            await self.login.client.delete_messages(target_chat_id, [message_id], revoke=True)
+            logger.info("Deleted old CRM card %s through the CRM admin account", message_id)
+            return True
+        except Exception:
+            logger.warning(
+                "Could not delete CRM card %s (Bot API: %s; admin fallback failed)",
+                message_id, bot_error, exc_info=True,
+            )
+            return False
 
     async def _retire_migrated_chat(self, target_chat_id: int, chat_id: int) -> None:
         """Drop the obsolete pre-migration group so it never creates a duplicate task."""
@@ -237,15 +253,7 @@ class InactivityMonitor:
         if chat is None or chat.is_excluded:
             return
         if chat.notification_message_id is not None:
-            try:
-                await self.bot.delete_message(target_chat_id, chat.notification_message_id)
-            except TelegramBadRequest as error:
-                logger.warning(
-                    "Could not delete legacy migration card %s for chat %s: %s",
-                    chat.notification_message_id,
-                    chat_id,
-                    error.message,
-                )
+            await self.delete_crm_card(target_chat_id, chat.notification_message_id)
         self.database.retire_migrated_chat(chat_id)
         logger.info("Stopped monitoring legacy chat %s after Telegram migration", chat_id)
 
@@ -363,10 +371,7 @@ class InactivityMonitor:
             return 0
         removed = 0
         for chat_id, message_id in self.database.notification_cards():
-            try:
-                await self.bot.delete_message(target_chat_id, message_id)
-            except TelegramBadRequest:
-                logger.warning("Could not delete old alert card %s", message_id)
+            if not await self.delete_crm_card(target_chat_id, message_id):
                 continue
             self.database.clear_notification(chat_id)
             removed += 1

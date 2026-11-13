@@ -137,12 +137,7 @@ def create_router(
             await callback.answer("Чат не найден", show_alert=True)
             return
         await callback.answer("Чат исключён из мониторинга")
-        try:
-            await callback.message.delete()
-        except TelegramBadRequest as error:
-            logger.warning("Could not delete excluded alert card %s: %s", callback.message.message_id, error.message)
-        else:
-            logger.info("Excluded alert card %s deleted", callback.message.message_id)
+        await monitor.delete_crm_card(target_chat_id, callback.message.message_id)
 
     @router.callback_query(F.data.startswith("done:"))
     async def done(callback: CallbackQuery) -> None:
@@ -162,12 +157,7 @@ def create_router(
             return
         database.resolve(chat_id)
         await callback.answer("Уведомление закрыто")
-        try:
-            await callback.message.delete()
-        except TelegramBadRequest as error:
-            logger.warning("Could not delete resolved alert card %s: %s", callback.message.message_id, error.message)
-        else:
-            logger.info("Resolved alert card %s deleted", callback.message.message_id)
+        await monitor.delete_crm_card(target_chat_id, callback.message.message_id)
 
     @router.callback_query(F.data.startswith("find:"))
     async def find_chat(callback: CallbackQuery) -> None:
